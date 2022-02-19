@@ -6,9 +6,13 @@
 import os
 import shutil
 import errno
+import math
 import numpy as np
 import scipy.ndimage
+import scipy.stats
 from sklearn.preprocessing import StandardScaler
+from skimage.segmentation import chan_vese
+from skimage.filters import gaussian
 import nibabel as nib
 
 
@@ -26,10 +30,27 @@ def mkdir_p(path):
     return True
 
 
-def resample_data(input_resample_data_array, data_array):
+def get_next_geometric_value(an, a0):
+    print("get_next_geometric_value")
+
+    n = math.log2(an / a0) + 1
+
+    if not n.is_integer():
+        an = a0 * np.power(2, (math.ceil(n) - 1))
+
+    return an
+
+
+def resample_data(input_resample_data_array, data_array=None):
     print("resample_data")
 
-    data_array_shape = data_array.shape
+    if data_array is not None:
+        data_array_shape = data_array.shape
+    else:
+        data_array_shape = [get_next_geometric_value(input_resample_data_array.shape[0], 2),
+                            get_next_geometric_value(input_resample_data_array.shape[1], 2),
+                            get_next_geometric_value(input_resample_data_array.shape[2], 2),
+                            input_resample_data_array.shape[3]]
 
     resample_data_array = input_resample_data_array.copy()
     resample_data_array_shape = resample_data_array.shape
@@ -44,21 +65,85 @@ def resample_data(input_resample_data_array, data_array):
     return input_resample_data_array
 
 
+# https://stackoverflow.com/questions/44865023/how-can-i-create-a-circular-mask-for-a-numpy-array
+def create_circular_mask(height, width, centre=None, radius=None):
+    print("create_circular_mask")
+
+    # use the middle of the image
+    if centre is None:
+        centre = (int(round(width / 2)),
+                  int(round(height / 2)))
+
+    # use the smallest distance between the center and image walls
+    if radius is None:
+        radius = min(centre[0], centre[1], width - centre[0], height - centre[1])
+    else:
+        if radius < 0.0:
+            radius = min(centre[0], centre[1], int(round((width - centre[0]) + radius)),
+                         int(round((height - centre[1]) + radius)))
+
+    y, x = np.ogrid[: height, : width]
+    dist_from_centre = np.sqrt(((x - centre[0]) ** 2.0) + ((y - centre[1]) ** 2.0))
+
+    mask = dist_from_centre <= radius
+
+    return mask
+
+
+def mask_fov(array, mask_value=0.0):
+    print("mask_fov")
+
+    array_shape = np.shape(array)
+
+    mask = create_circular_mask(array_shape[0], array_shape[1])
+
+    for i in range(array_shape[2]):
+        masked_img = array[:, :, i].copy()
+        masked_img[~ mask] = mask_value
+
+        array[:, :, i] = masked_img
+
+    return array
+
+
+def object_detection(data_array):
+    print("object_detection")
+
+    data_array = data_array[:, :, :, 0]
+
+    objects = []
+
+    for i in range(data_array.shape[2]):
+        current_object = chan_vese(data_array[:, :, i], mu=1e-04, dt=1.0, init_level_set=data_array[:, :, 0])
+
+        objects.append(current_object)
+
+    objects = np.moveaxis(np.array(objects), [0, 1, 2], [2, 0, 1])
+
+    objects = gaussian(objects, sigma=3.0)
+
+    objects_shape = objects.shape
+    objects = objects.reshape(-1, 1)
+
+    objects = StandardScaler().fit_transform(objects)
+
+    objects = objects.reshape(objects_shape)
+
+    output = np.array([data_array, objects])
+    output = np.moveaxis(output, [0, 1, 2, 3], [3, 0, 1, 2])
+
+    return output
+
+
 def preprocessing(data_array):
     print("preprocessing")
 
     standard_scaler_list = []
 
-    if data_array.ndim > 3:
-        number_of_time_points = data_array.shape[3]
-    else:
-        number_of_time_points = 1
+    data_array = mask_fov(data_array)
 
-    for i in range(number_of_time_points):
-        if data_array.ndim > 3:
-            current_data_array = data_array[:, :, :, i]
-        else:
-            current_data_array = data_array.copy()
+    for i in range(data_array.shape[3]):
+        current_data_array = data_array[:, :, :, i]
 
         current_data_array_shape = current_data_array.shape
         current_data_array = current_data_array.reshape(-1, 1)
@@ -66,10 +151,9 @@ def preprocessing(data_array):
         standard_scaler_list.append(StandardScaler())
         current_data_array = standard_scaler_list[-1].fit_transform(current_data_array)
 
-        if data_array.ndim > 3:
-            data_array[:, :, :, i] = current_data_array.reshape(current_data_array_shape)
-        else:
-            data_array = current_data_array.reshape(current_data_array_shape)
+        data_array[:, :, :, i] = current_data_array.reshape(current_data_array_shape)
+
+    data_array = object_detection(data_array)
 
     return data_array, standard_scaler_list
 
@@ -93,11 +177,11 @@ def register(output_path, nifty_reg_path, floating_data_path, reference_data_pat
     cpp_output_path = "{0}/cpp.nii.gz".format(output_path)
     res_output_path = "{0}/res.nii.gz".format(output_path)
 
-    spacing = -5
-    be = 1e-03
+    spacing = -16
+    be = 1e-07
     le = 1e-02
-    jl = 0.0
-    ln = 3
+    jl = 1e-05
+    ln = 4
 
     nifty_reg_command = "{0} -ref {1} -flo {2} -cpp {3} -res {4} -sx {5} -be {6} -le {7} -jl {8} -ln {9} -vel".format(nifty_reg_path, reference_data_path, floating_data_path, cpp_output_path, res_output_path, str(spacing), str(be), str(le), str(jl), str(ln))
 
@@ -110,26 +194,18 @@ def register(output_path, nifty_reg_path, floating_data_path, reference_data_pat
 def inverse_preprocessing(data_array, standard_scaler_list):
     print("inverse_preprocessing")
 
-    if data_array.ndim > 3:
-        number_of_time_points = data_array.shape[3]
-    else:
-        number_of_time_points = 1
+    data_array = data_array[:, :, :, 0]
+    data_array = np.expand_dims(data_array, axis=3)
 
-    for i in range(number_of_time_points):
-        if data_array.ndim > 3:
-            current_data_array = data_array[:, :, :, i]
-        else:
-            current_data_array = data_array.copy()
+    for i in range(data_array.shape[3]):
+        current_data_array = data_array[:, :, :, i]
 
         current_data_array_shape = current_data_array.shape
         current_data_array = current_data_array.reshape(-1, 1)
 
         current_data_array = standard_scaler_list[i].inverse_transform(current_data_array)
 
-        if data_array.ndim > 3:
-            data_array[:, :, :, i] = current_data_array.reshape(current_data_array_shape)
-        else:
-            data_array = current_data_array.reshape(current_data_array_shape)
+        data_array[:, :, :, i] = current_data_array.reshape(current_data_array_shape)
 
     return data_array
 
@@ -160,8 +236,17 @@ def main():
     floating_data = nib.load(floating_data_path)
     reference_data = nib.load(reference_data_path)
 
-    floating_data_array = np.nan_to_num(floating_data.get_fdata()[:, :, :, 0])
-    reference_data_array = np.nan_to_num(reference_data.get_fdata()[:, :, :, 0])
+    # floating_data_array = np.nan_to_num(floating_data.get_fdata()[:, :, :, 0])
+    # reference_data_array = np.nan_to_num(reference_data.get_fdata()[:, :, :, 0])
+
+    floating_data_array = np.nan_to_num(floating_data.get_fdata()[:, :, 0, 0])
+    reference_data_array = np.nan_to_num(reference_data.get_fdata()[:, :, 0, 0])
+
+    floating_data_array = np.expand_dims(floating_data_array, axis=2)
+    reference_data_array = np.expand_dims(reference_data_array, axis=2)
+
+    floating_data_array = np.expand_dims(floating_data_array, axis=3)
+    reference_data_array = np.expand_dims(reference_data_array, axis=3)
 
     # floating_data_array = np.nan_to_num(floating_data.get_fdata())
     # reference_data_array = np.nan_to_num(reference_data.get_fdata())
@@ -177,6 +262,9 @@ def main():
         floating_data_array = resample_data(floating_data_array, reference_data_array)
 
         preprocessed_data_voxel_sizes = reference_data.header.get_zooms()
+
+    reference_data_array = resample_data(reference_data_array)
+    floating_data_array = resample_data(floating_data_array)
 
     floating_data_array, floating_data_array_standard_scaler = preprocessing(floating_data_array)
     reference_data_array, reference_data_array_standard_scaler = preprocessing(reference_data_array)
@@ -213,6 +301,12 @@ def main():
 
     floating_data_array = np.nan_to_num(registered_floating_data.get_fdata())
     reference_data_array = np.nan_to_num(registered_reference_data.get_fdata())
+
+    floating_data_array = np.expand_dims(floating_data_array, axis=2)
+    reference_data_array = np.expand_dims(reference_data_array, axis=2)
+
+    floating_data_array = np.expand_dims(floating_data_array, axis=3)
+    reference_data_array = np.expand_dims(reference_data_array, axis=3)
 
     floating_data_array = inverse_preprocessing(floating_data_array, floating_data_array_standard_scaler)
     reference_data_array = inverse_preprocessing(reference_data_array, reference_data_array_standard_scaler)
